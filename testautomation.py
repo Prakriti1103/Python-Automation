@@ -169,7 +169,7 @@ def main():
     compare_images(doc1, doc2, output_doc)
 
     output_doc.save("final_doc_comparison_with_images.docx")
-    print("✅ Done! Output saved as: final_doc_comparison_with_images.docx")
+    print(" Done! Output saved as: final_doc_comparison_with_images.docx")
 
 if __name__ == "__main__":
     main()
