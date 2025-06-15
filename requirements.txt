@@ -1,0 +1,16 @@
+required packages:
+python-docx
+(if you add future PDF/Image support: also add pdf2docx, fitz, etc.)
+
+Add your two files as:
+May 19 .docx
+May 28 .docx
+
+Run the Script
+
+Sample Output:
+Line-by-line differences with highlights like:
+[Text Changed] Old: "Payment pending"
+New: "Payment completed"
+[Font Size Changed] 12.0 → 11.0
+[Image Removed] Image 3 (Width: 4000000 EMU, Height: 3000000 EMU)
