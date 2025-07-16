@@ -1,5 +1,6 @@
 
 Word Document Comparator (Streamlit App)
+
 Compare two Word documents (.docx) and generate a detailed report of all differences including:
 
 ✅ Text Changes
