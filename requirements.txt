@@ -1,5 +1,7 @@
 required packages:
 python-docx
+streamlit
+lxml
 (if you add future PDF/Image support: also add pdf2docx, fitz, etc.)
 
 Add your two files as:
