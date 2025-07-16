@@ -47,7 +47,7 @@ Structure (paragraphs, tables, images, etc.
 
 Clone the repo and install dependencies:
 
-git clone https://github.com/your-username/word-comparator.git
+git clone [https://github.com/your-username/word-comparator.git](https://github.com/Prakriti1103/Python-Automation.git)
 
 cd word-comparator
 
