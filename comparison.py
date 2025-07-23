@@ -373,56 +373,52 @@ def compare_images(doc1, doc2, output_doc):
                     add_colored_paragraph(output_doc, f"[Added Image {j+1}]", f"Size: {imgs2[j]}", (0, 128, 0))
 
 # ====================== SREAMLIT UI ================================
-from comparison import compare_paragraphs, compare_textboxes, compare_headers_footers, compare_tables, compare_images
+if __name__ == "__main__":
+    st.set_page_config(page_title="Word File Comparator", layout="centered")
+    st.title("📄 Word Document Comparator")
+    st.markdown("Upload your **Pre** and **Post** Word documents to compare changes like **text, formatting, spacing, fonts, images, tables, headers/footers, etc.**")
 
-st.set_page_config(page_title="Word File Comparator", layout="centered")
-st.title("📄 Word Document Comparator")
-st.markdown("Upload your **Pre** and **Post** Word documents to compare changes like **text, formatting, spacing, fonts, images, tables, headers/footers, etc.**")
+    st.subheader("📤 Upload Pre Document (.docx)")
+    uploaded_pre = st.file_uploader("Upload the PRE document", type=["docx"], key="pre")
 
-# Uploaders
-st.subheader("📤 Upload Pre Document (.docx)")
-uploaded_pre = st.file_uploader("Upload the PRE document", type=["docx"], key="pre")
+    st.subheader("📥 Upload Post Document (.docx)")
+    uploaded_post = st.file_uploader("Upload the POST document", type=["docx"], key="post")
 
-st.subheader("📥 Upload Post Document (.docx)")
-uploaded_post = st.file_uploader("Upload the POST document", type=["docx"], key="post")
+    if uploaded_pre and uploaded_post:
+        if st.button("🔍 Compare Documents"):
+            with st.spinner("Comparing documents, please wait..."):
+                doc1 = Document(uploaded_pre)
+                doc2 = Document(uploaded_post)
+                output_doc = Document()
 
-if uploaded_pre and uploaded_post:
-    if st.button("🔍 Compare Documents"):
-        with st.spinner("Comparing documents, please wait..."):
-            doc1 = Document(uploaded_pre)
-            doc2 = Document(uploaded_post)
-            output_doc = Document()
+                compare_paragraphs(doc1, doc2, output_doc)
+                compare_textboxes(doc1, doc2, output_doc)
+                compare_headers_footers(doc1, doc2, output_doc)
+                compare_tables(doc1, doc2, output_doc)
+                compare_images(doc1, doc2, output_doc)
 
-            compare_paragraphs(doc1, doc2, output_doc)
-            compare_textboxes(doc1, doc2, output_doc)
-            compare_headers_footers(doc1, doc2, output_doc)
-            compare_tables(doc1, doc2, output_doc)
-            compare_images(doc1, doc2, output_doc)
+                buffer = BytesIO()
+                output_doc.save(buffer)
+                buffer.seek(0)
 
-            buffer = BytesIO()
-            output_doc.save(buffer)
-            buffer.seek(0)
+                pre_name = uploaded_pre.name.rsplit('.', 1)[0]
+                post_name = uploaded_post.name.rsplit('.', 1)[0]
+                dynamic_filename = f"Comparison_{pre_name}_vs_{post_name}.docx"
 
-            pre_name = uploaded_pre.name.rsplit('.', 1)[0]
-            post_name = uploaded_post.name.rsplit('.', 1)[0]
-            dynamic_filename = f"Comparison_{pre_name}_vs_{post_name}.docx"
+            st.success("✅ Comparison Complete!")
 
-        st.success("✅ Comparison Complete!")
+            st.markdown("### 📊 Summary of Changes")
+            st.write("- Paragraphs compared ✅")
+            st.write("- Tables compared ✅")
+            st.write("- Images compared ✅")
+            st.write("- Text boxes compared ✅")
+            st.write("- Headers/Footers compared ✅")
 
-        # Optional: Summary Section placeholder
-        st.markdown("### 📊 Summary of Changes")
-        st.write("- Paragraphs compared ✅")
-        st.write("- Tables compared ✅")
-        st.write("- Images compared ✅")
-        st.write("- Text boxes compared ✅")
-        st.write("- Headers/Footers compared ✅")
-
-        # Download button
-        st.download_button(
-            "⬇️ Download Comparison Report",
-            data=buffer.getvalue(),
-            file_name=dynamic_filename,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
-else:
-    st.info("📌 Please upload both **Pre** and **Post** documents to begin comparison.")
+            st.download_button(
+                "⬇️ Download Comparison Report",
+                data=buffer.getvalue(),
+                file_name=dynamic_filename,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+    else:
+        st.info("📌 Please upload both **Pre** and **Post** documents to begin comparison.")
