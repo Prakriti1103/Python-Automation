@@ -1069,107 +1069,321 @@ def compare_tables(doc1, doc2, output_doc):
                 i += 1
 
 # =============================== Image Comparison ========================================
-
 EMU_PER_INCH = 914400
+
 def emu_to_inches_img(emu):
     try:
         return round(int(emu) / EMU_PER_INCH, 2)
-    except:
+    except Exception:
         return None
 
-def get_image_hash(shape):
-    """Return SHA1 hash of image binary (if inline shape is a picture)."""
-    try:
-        blip = shape._element.xpath('.//a:blip')[0]
-        rId = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
-        part = shape.part.related_parts[rId]
-        return hashlib.sha1(part.blob).hexdigest()
-    except:
-        return None
 
 def extract_images(doc):
-    """Extract images with size + hash."""
+    
     images = []
-    for shape in doc.inline_shapes:
-        w, h = None, None
+    for i, shape in enumerate(doc.inline_shapes, start=1):
         try:
-            w = emu_to_inches_img(shape.width)
-            h = emu_to_inches_img(shape.height)
-        except:
-            pass
-        hsh = get_image_hash(shape)
-        images.append({"hash": hsh, "width": w, "height": h})
+            width = emu_to_inches_img(shape._inline.extent.cx)
+            height = emu_to_inches_img(shape._inline.extent.cy)
+
+            # Find parent paragraph safely
+            p = shape._inline.getparent()
+            while p is not None and p.tag != qn("w:p"):
+                p = p.getparent()
+
+            para_index = None
+            if p is not None:
+                for idx, para in enumerate(doc.paragraphs, start=1):
+                    if para._p == p:
+                        para_index = idx
+                        break
+
+            images.append({
+                "id": i,
+                "width": width,
+                "height": height,
+                "para_index": para_index
+            })
+        except Exception:
+            continue
     return images
 
 def compare_images(doc1, doc2, output_doc):
-    imgs1 = extract_images(doc1)
-    imgs2 = extract_images(doc2)
+    
+    import hashlib, io, math
+    from collections import defaultdict
+
+    EMU_PER_INCH_IMG = 914400
+    NS = {
+        'w':  "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        'wp': "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        'a':  "http://schemas.openxmlformats.org/drawingml/2006/main",
+        'pic':"http://schemas.openxmlformats.org/drawingml/2006/picture",
+        'r':  "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+
+    # thresholds (tweakable)
+    VHASH_HAMMING_THRESHOLD = 10      # for 64-bit aHash (<=10 considered same-ish)
+    SIZE_MATCH_TOLERANCE_IN = 0.6     # inches total tolerance (w diff + h diff)
+    MIN_SIZE_FILTER_IN = 0.0          # ignore images smaller than this (both dims); 0 = keep all
+
+    def emu_to_inches_img(emu_val):
+        try:
+            return round(int(emu_val) / EMU_PER_INCH_IMG, 2)
+        except Exception:
+            return None
+
+    # compute hamming distance
+    def hamming(a, b):
+        if a is None or b is None:
+            return 999
+        x = a ^ b
+        return x.bit_count() if hasattr(x, "bit_count") else bin(x).count("1")
+
+    # Robust extractor: walks paragraph runs and finds a:blip r:embed
+    def extract_images_for_compare(doc):
+        imgs = []
+        idx = 0
+        try:
+            from PIL import Image
+            pil_ok = True
+        except Exception:
+            pil_ok = False
+            Image = None
+
+        for p_idx, para in enumerate(doc.paragraphs, start=1):
+            for run in para.runs:
+                r = getattr(run, "_r", None)
+                if r is None:
+                    continue
+
+                # try xpath for blips (works in most python-docx versions)
+                try:
+                    blip_nodes = r.xpath('.//a:blip', namespaces=NS)
+                except Exception:
+                    # fallback: iterate and find elements ending with '}blip'
+                    blip_nodes = [el for el in r.iter() if str(el.tag).endswith('}blip')]
+
+                if not blip_nodes:
+                    continue
+
+                for blip in blip_nodes:
+                    rid = blip.get('{%s}embed' % NS['r'])
+                    if not rid:
+                        continue
+                    # get part blob
+                    try:
+                        part = doc.part.related_parts[rid]
+                        blob = part.blob
+                    except Exception:
+                        # relationship missing; skip
+                        continue
+
+                    # get size if present in drawing extent (wp:extent)
+                    w_in = h_in = None
+                    try:
+                        ext_nodes = r.xpath('.//wp:extent', namespaces=NS)
+                    except Exception:
+                        ext_nodes = [el for el in r.iter() if str(el.tag).endswith('}extent')]
+                    if ext_nodes:
+                        cx = ext_nodes[0].get('cx')
+                        cy = ext_nodes[0].get('cy')
+                        w_in = emu_to_inches_img(cx) if cx else None
+                        h_in = emu_to_inches_img(cy) if cy else None
+
+                    # optional tiny filtering
+                    if (w_in is not None and h_in is not None and
+                        (w_in < MIN_SIZE_FILTER_IN and h_in < MIN_SIZE_FILTER_IN)):
+                        continue
+
+                    # content hash
+                    sha1 = hashlib.sha1(blob).hexdigest()
+
+                    # visual hash (aHash 8x8) if Pillow available
+                    vhash = None
+                    if pil_ok:
+                        try:
+                            img = Image.open(io.BytesIO(blob)).convert('L')
+                            # resize to 8x8
+                            if hasattr(Image, "Resampling"):
+                                img = img.resize((8, 8), Image.Resampling.LANCZOS)
+                            else:
+                                img = img.resize((8, 8), Image.ANTIALIAS)
+                            pixels = list(img.getdata())
+                            avg = sum(pixels) // len(pixels)
+                            bits = 0
+                            for px in pixels:
+                                bits = (bits << 1) | (1 if px > avg else 0)
+                            vhash = bits  # 64-bit-ish integer
+                        except Exception:
+                            vhash = None
+
+                    idx += 1
+                    imgs.append({
+                        "sha1": sha1,
+                        "vhash": vhash,
+                        "w": w_in,
+                        "h": h_in,
+                        "pidx": p_idx,
+                        "order_idx": idx,
+                        "blob": blob
+                    })
+        return imgs
+
+    # pairing helpers
+    def greedy_match_by_key(list_a, list_b, key_fn, score_fn, threshold):
+       
+        A = list(range(len(list_a)))
+        B = list(range(len(list_b)))
+        candidates = []
+        for i in A:
+            for j in B:
+                s = score_fn(list_a[i], list_b[j])
+                if s >= threshold:
+                    candidates.append((s, i, j))
+        # sort descending by score
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        usedA, usedB = set(), set()
+        pairs = []
+        for s, i, j in candidates:
+            if i in usedA or j in usedB:
+                continue
+            usedA.add(i); usedB.add(j)
+            pairs.append((i, j))
+        leftoverA = [i for i in A if i not in usedA]
+        leftoverB = [j for j in B if j not in usedB]
+        return pairs, leftoverA, leftoverB
+
+    # score functions
+    def score_sha(a, b):
+        return 1.0 if a["sha1"] == b["sha1"] else 0.0
+
+    def score_vhash(a, b):
+        if a["vhash"] is None or b["vhash"] is None:
+            return 0.0
+        # score = inverse normalized hamming distance (64 bits)
+        ham = hamming(a["vhash"], b["vhash"])
+        # map ham 0..64 to score 1..0
+        sc = max(0.0, 1.0 - (ham / 64.0))
+        return sc
+
+    def score_size_and_proximity(a, b):
+        # size similarity: smaller diff -> higher score
+        aw, ah = a.get("w") or 0, a.get("h") or 0
+        bw, bh = b.get("w") or 0, b.get("h") or 0
+        size_diff = abs(aw - bw) + abs(ah - bh)
+        size_score = max(0.0, 1.0 - (size_diff / SIZE_MATCH_TOLERANCE_IN))
+        # paragraph proximity
+        pa, pb = a.get("pidx") or 0, b.get("pidx") or 0
+        prox = abs((pa - pb))
+        prox_score = max(0.0, 1.0 - min(prox, 20) / 20.0)
+        return 0.6 * size_score + 0.4 * prox_score
+
+    # run extraction
+    imgs1 = extract_images_for_compare(doc1)
+    imgs2 = extract_images_for_compare(doc2)
 
     output_doc.add_heading("Image Comparison", level=1)
 
-    used1, used2 = set(), set()
-    img_counter = 1
+    # 1) exact sha matches (score 1.0)
+    pairs_sha, rem1, rem2 = greedy_match_by_key(imgs1, imgs2, lambda x: x["sha1"], lambda a,b: 1.0 if a["sha1"] == b["sha1"] else 0.0, 1.0)
 
-    for i2, im2 in enumerate(imgs2):
-        best_j, best_score = None, float("inf")
-        for j, im1 in enumerate(imgs1):
-            if j in used1:
-                continue
+    matched_a = set(i for i,_ in pairs_sha)
+    matched_b = set(j for _,j in pairs_sha)
+    final_pairs = list(pairs_sha)
 
-            # Similarity score
-            score = 0
-            if im1["hash"] != im2["hash"]:
-                score += 5
-            size_diff = ((im1["width"] or 0) - (im2["width"] or 0))**2 + ((im1["height"] or 0) - (im2["height"] or 0))**2
-            score += size_diff
+    # 2) visual hash matching for leftovers if Pillow available
+    leftovers1 = [imgs1[i] for i in range(len(imgs1)) if i not in matched_a]
+    leftovers2 = [imgs2[j] for j in range(len(imgs2)) if j not in matched_b]
+    if leftovers1 and leftovers2:
+        pairs_v, la, lb = greedy_match_by_key(leftovers1, leftovers2, None, score_vhash, 1.0 - (VHASH_HAMMING_THRESHOLD / 64.0))
+        # map back to original indices
+        # leftovers1[i] corresponds to original index idx1 where imgs1[idx1] == leftovers1[i]
+        idx_map1 = [i for i in range(len(imgs1)) if i not in matched_a]
+        idx_map2 = [j for j in range(len(imgs2)) if j not in matched_b]
+        for i_local, j_local in pairs_v:
+            i_orig = idx_map1[i_local]
+            j_orig = idx_map2[j_local]
+            final_pairs.append((i_orig, j_orig))
+            matched_a.add(i_orig); matched_b.add(j_orig)
 
-            if score < best_score:
-                best_score, best_j = score, j
+    # 3) size+proximity match for remaining
+    leftovers1 = [i for i in range(len(imgs1)) if i not in matched_a]
+    leftovers2 = [j for j in range(len(imgs2)) if j not in matched_b]
+    if leftovers1 and leftovers2:
+        listA = [imgs1[i] for i in leftovers1]
+        listB = [imgs2[j] for j in leftovers2]
+        # use score_size_and_proximity, threshold low
+        pairs_s, la, lb = greedy_match_by_key(listA, listB, None, score_size_and_proximity, 0.25)
+        # map back indices
+        for i_local, j_local in pairs_s:
+            i_orig = leftovers1[i_local]
+            j_orig = leftovers2[j_local]
+            final_pairs.append((i_orig, j_orig))
+            matched_a.add(i_orig); matched_b.add(j_orig)
 
-        if best_j is not None and best_score < 10:  # threshold
-            used1.add(best_j)
-            used2.add(i2)
-            im1 = imgs1[best_j]
+    # Now produce reports
+    used_pairs = set()
+    counter = 1
+    # sort pairs by new doc order for nicer output
+    final_pairs_sorted = sorted(final_pairs, key=lambda pair: imgs2[pair[1]]["order_idx"] if pair[1] < len(imgs2) else 0)
+    for (ia, jb) in final_pairs_sorted:
+        a = imgs1[ia]; b = imgs2[jb]
+        moved = (a.get("pidx") != b.get("pidx"))
+        size_changed = (a.get("w") != b.get("w") or a.get("h") != b.get("h"))
 
-            # --- cases ---
-            if im1["hash"] == im2["hash"]:
-                if (im1["width"], im1["height"]) != (im2["width"], im2["height"]):
-                    # Size changed
-                    p = output_doc.add_paragraph(f"[Image Modified] Image {img_counter}")
-                    p.runs[0].font.color.rgb = RGBColor(0, 0, 255)
-                    output_doc.add_paragraph(f"Old: Size={im1['width']}in × {im1['height']}in")
-                    output_doc.add_paragraph(f"New: Size={im2['width']}in × {im2['height']}in")
-                elif best_j != i2:
-                    # Same image, same size, but different order
-                    p = output_doc.add_paragraph(f"[Image Moved] Image {img_counter}")
-                    p.runs[0].font.color.rgb = RGBColor(255, 140, 0)
-                    output_doc.add_paragraph(f"Image hash={im1['hash'][:10]}... moved from position {best_j+1} → {i2+1}")
-                # else: identical → no output
-
-            elif im1["hash"] != im2["hash"]:
-                # Different image, replacing
-                p = output_doc.add_paragraph(f"[Image Replaced] Image {img_counter}")
-                p.runs[0].font.color.rgb = RGBColor(255, 165, 0)
-                output_doc.add_paragraph(f"Old: Size={im1['width']}in × {im1['height']}in")
-                output_doc.add_paragraph(f"New: Size={im2['width']}in × {im2['height']}in")
-
-            img_counter += 1
-
+        if size_changed and not moved:
+            add_colored_paragraph(
+                output_doc,
+                f"[Image Modified] Image {counter}",
+                f"Old: Size={a.get('w')}in × {a.get('h')}in\nNew: Size={b.get('w')}in × {b.get('h')}in",
+                (0, 0, 255)
+            )
+        elif moved and not size_changed:
+            add_colored_paragraph(
+                output_doc,
+                f"[Image Moved] Image {counter}",
+                f"Size: {b.get('w')}in × {b.get('h')}in\nOld position: Paragraph {a.get('pidx')} → New position: Paragraph {b.get('pidx')}",
+                (255, 165, 0)
+            )
+        elif moved and size_changed:
+            add_colored_paragraph(
+                output_doc,
+                f"[Image Modified] Image {counter}",
+                f"Old: Size={a.get('w')}in × {a.get('h')}in\nNew: Size={b.get('w')}in × {b.get('h')}in\nOld position: Paragraph {a.get('pidx')} → New: Paragraph {b.get('pidx')}",
+                (0, 0, 255)
+            )
         else:
-            # New image added
-            used2.add(i2)
-            p = output_doc.add_paragraph(f"[Image Added] Image {img_counter}")
-            p.runs[0].font.color.rgb = RGBColor(0, 128, 0)
-            output_doc.add_paragraph(f"Size: {im2['width']}in × {im2['height']}in")
-            img_counter += 1
+            # exact same content and size/position -> nothing to report
+            pass
 
-    # leftover = removed
-    for i1, im1 in enumerate(imgs1):
-        if i1 not in used1:
-            p = output_doc.add_paragraph(f"[Image Removed] Image {img_counter}")
-            p.runs[0].font.color.rgb = RGBColor(255, 0, 0)
-            output_doc.add_paragraph(f"Size: {im1['width']}in × {im1['height']}in")
-            img_counter += 1
+        used_pairs.add((ia, jb))
+        counter += 1
+
+    # Removed (present in doc1 but not matched)
+    for i, rec in enumerate(imgs1):
+        if i in matched_a:
+            continue
+        add_colored_paragraph(
+            output_doc,
+            f"[Image Removed] Image {counter}",
+            f"Size: {rec.get('w')}in × {rec.get('h')}in\nOld position: Paragraph {rec.get('pidx')}",
+            (255, 0, 0)
+        )
+        counter += 1
+
+    # Added (present in doc2 but not matched)
+    for j, rec in enumerate(imgs2):
+        if j in matched_b:
+            continue
+        add_colored_paragraph(
+            output_doc,
+            f"[Image Added] Image {counter}",
+            f"Size: {rec.get('w')}in × {rec.get('h')}in\nPosition: Paragraph {rec.get('pidx')}",
+            (0, 128, 0)
+        )
+        counter += 1
+
 
 # =================================Shape Comparison ========================================================
 EMU_PER_INCH = 914400
@@ -1409,6 +1623,66 @@ def compare_page_breaks(doc1, doc2, output_doc):
     if not changes_found:
         output_doc.add_paragraph("No page break differences found ✅")
 
+#===================================== Moved paragraph comparison ==================================
+
+from collections import defaultdict
+
+def group_paragraphs(doc, block_size=1):
+    """Group paragraphs into blocks (default 1 para per block)."""
+    blocks = []
+    buf = []
+    for p in doc.paragraphs:
+        txt = p.text.strip()
+        if txt:
+            buf.append(txt)
+            if len(buf) >= block_size:
+                blocks.append("\n".join(buf))
+                buf = []
+    if buf:
+        blocks.append("\n".join(buf))
+    return blocks
+
+def compare_moved_paragraphs(doc1, doc2, output_doc):
+    output_doc.add_heading("Moved Paragraphs Comparison", level=1)
+
+    blocks1 = group_paragraphs(doc1, block_size=1)
+    blocks2 = group_paragraphs(doc2, block_size=1)
+
+    pos1 = defaultdict(list)
+    pos2 = defaultdict(list)
+
+    for i, b in enumerate(blocks1):
+        pos1[b].append(i)
+    for j, b in enumerate(blocks2):
+        pos2[b].append(j)
+
+    found = False
+    reported = set()  # to avoid duplicates
+
+    for text in set(pos1.keys()).intersection(pos2.keys()):
+        # only check the first occurrence for simplicity
+        idx1 = pos1[text][0]
+        idx2 = pos2[text][0]
+
+        if idx1 != idx2:
+            key = (text, min(idx1, idx2), max(idx1, idx2))
+            if key in reported:
+                continue
+            reported.add(key)
+
+            found = True
+            preview = text[:120].replace("\n", " / ")
+            output_doc.add_paragraph(
+                f"[Paragraph Block Moved] \"{preview}\"",
+                style="Heading 3"
+            )
+            output_doc.add_paragraph(
+                f"Old position: Block {idx1+1} → New position: Block {idx2+1}"
+            )
+
+    if not found:
+        output_doc.add_paragraph("No moved paragraphs found ✅")
+
 # ====================== SREAMLIT UI ================================
 if __name__ == "__main__":
     st.set_page_config(page_title="Word File Comparator", layout="centered")
@@ -1428,6 +1702,7 @@ if __name__ == "__main__":
                 doc2 = Document(uploaded_post)
                 output_doc = Document()
 
+                compare_moved_paragraphs(doc1, doc2, output_doc)
                 compare_paragraphs(doc1, doc2, output_doc)
                 compare_textboxes(doc1, doc2, output_doc)
                 compare_headers_footers(doc1, doc2, output_doc)
@@ -1448,6 +1723,7 @@ if __name__ == "__main__":
             st.success("✅ Comparison Complete!")
 
             st.markdown("### 📊 Summary of Changes")
+            st.write("- Moved Paragraphs compared ✅")
             st.write("- Paragraphs compared ✅")
             st.write("- Tables compared ✅")
             st.write("- Images compared ✅")
@@ -1464,4 +1740,5 @@ if __name__ == "__main__":
             )
     else:
         st.info("📌 Please upload both **Pre** and **Post** documents to begin comparison.")
+
 
